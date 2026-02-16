@@ -1,0 +1,134 @@
+name: VESC Firmware Builder – Multi HW Archive
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Clone official VESC firmware
+        run: |
+          git clone --depth 1 --branch release_6_06 https://github.com/vedderb/bldc.git bldc
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            git \
+            make \
+            wget \
+            libgl-dev \
+            libxcb-xinerama0
+
+      - name: Install VESC ARM SDK (official)
+        run: |
+          cd bldc
+          make arm_sdk_install
+
+      - name: Inject all custom hwconf
+        run: |
+          find custom_hwconf -type f \( -name "hw_*.c" -o -name "hw_*.h" \) \
+            -exec cp {} bldc/hwconf/ \;
+
+      - name: Build firmware (configurable)
+        run: |
+          set -e
+
+          # ==============================
+          # USER CONFIGURATION
+          # ==============================
+          BUILD_MODE="all"        # all | single
+          SINGLE_MODEL="C350V3"  # used only if BUILD_MODE=single
+
+          BUILD_NO_LIMITS="yes"  # yes | no
+          PREFIX_RFP="yes"       # yes | no
+
+          VERSION="V6.06"
+          TAG="release_6_06"
+          # ==============================
+
+          mkdir -p archive/$TAG
+
+          build_one() {
+            MODEL_TECH="$1"
+            BRAND_DIR="$2"
+            MODEL_DIR="$3"
+            VARIANT="$4"   # "" or "_no_limits"
+
+            TARGET="fw_${MODEL_TECH}${VARIANT}"
+
+            echo "------------------------------"
+            echo "Building $TARGET"
+            echo "------------------------------"
+
+            cd bldc
+            if make -n "$TARGET" >/dev/null 2>&1; then
+              make "$TARGET"
+            else
+              echo "Target $TARGET does not exist, skipping."
+              cd ..
+              return
+            fi
+            cd ..
+
+            NAME_PREFIX=""
+            [ "$PREFIX_RFP" = "yes" ] && NAME_PREFIX="RFP_"
+
+            VARIANT_NAME=""
+            [ -n "$VARIANT" ] && VARIANT_NAME="_NO_LIMITS"
+
+            mkdir -p "archive/$TAG/$BRAND_DIR/$MODEL_DIR"
+
+            cp "bldc/build/${MODEL_TECH}${VARIANT}/${MODEL_TECH}${VARIANT}.bin" \
+               "archive/$TAG/$BRAND_DIR/$MODEL_DIR/${NAME_PREFIX}${MODEL_TECH}${VARIANT_NAME}_${VERSION}.bin"
+          }
+
+          if [ "$BUILD_MODE" = "single" ]; then
+            echo ">>> SINGLE BUILD MODE: $SINGLE_MODEL"
+
+            hwfile=$(find custom_hwconf -name "hw_${SINGLE_MODEL}.h" | head -n1)
+            [ -z "$hwfile" ] && echo "ERROR: hw_${SINGLE_MODEL}.h not found" && exit 1
+
+            MODEL_DIR=$(basename "$(dirname "$hwfile")")
+            BRAND_DIR=$(basename "$(dirname "$(dirname "$hwfile")")")
+
+            build_one "$SINGLE_MODEL" "$BRAND_DIR" "$MODEL_DIR" ""
+
+            [ "$BUILD_NO_LIMITS" = "yes" ] && \
+              build_one "$SINGLE_MODEL" "$BRAND_DIR" "$MODEL_DIR" "_no_limits"
+
+          else
+            echo ">>> FULL BUILD MODE"
+
+            find custom_hwconf -name "hw_*.h" | while read hwfile; do
+              MODEL_TECH=$(basename "$hwfile" .h)
+              MODEL_TECH=${MODEL_TECH#hw_}
+
+              MODEL_DIR=$(basename "$(dirname "$hwfile")")
+              BRAND_DIR=$(basename "$(dirname "$(dirname "$hwfile")")")
+
+              build_one "$MODEL_TECH" "$BRAND_DIR" "$MODEL_DIR" ""
+
+              [ "$BUILD_NO_LIMITS" = "yes" ] && \
+                build_one "$MODEL_TECH" "$BRAND_DIR" "$MODEL_DIR" "_no_limits"
+            done
+          fi
+
+      - name: Ensure no .nojekyll
+        run: |
+          rm -f archive/.nojekyll
+
+      - name: Push to firmware archive repo
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          external_repository: Foujiwara/rfp_fw_archive
+          publish_branch: main
+          publish_dir: ./archive
+          personal_token: ${{ secrets.ARCHIVE_TOKEN }}
+          enable_jekyll: false
